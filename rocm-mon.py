@@ -33,6 +33,9 @@ from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
+from rich.style import Style
+from rich.layout import Layout
 
 # Constants
 DEFAULT_INTERVAL: int = 5
@@ -196,53 +199,87 @@ class SystemMonitor:
         Returns:
             Panel: Rich panel object containing the formatted dashboard
         """
-        table = Table(title="System Monitor", box=box.ROUNDED, expand=True)
-        table.add_column("System Information", style="magenta")
+        layout = Layout()
         
-        # Format CPU usage with color
+        # Create the main table
+        table = Table(box=box.ROUNDED, expand=True, show_header=False)
+        table.add_column("Content", justify="left", style="white")
+        
+        # Format CPU usage with dynamic color
         cpu_usage = system_info['CPU Usage'].split('@')[0].strip()
         cpu_freq = system_info['CPU Usage'].split('@')[1].strip() if '@' in system_info['CPU Usage'] else ""
-        cpu_color = get_color_for_value(cpu_usage, CPU_THRESHOLDS)
+        cpu_val = float(cpu_usage.strip('%'))
+        cpu_style = "green" if cpu_val < 50 else "yellow" if cpu_val < 80 else "red"
         
-        # Format RAM usage with color
-        ram_color = get_color_for_value(system_info['RAM Usage'], RAM_THRESHOLDS)
-        ram_used = system_info['RAM Used']
-        ram_total = system_info['RAM Total']
+        # Format RAM usage with dynamic color
+        ram_val = float(system_info['RAM Usage'].strip('%'))
+        ram_style = "green" if ram_val < 60 else "yellow" if ram_val < 80 else "red"
+        ram_text = f"{system_info['RAM Usage']} ({system_info['RAM Used']}/{system_info['RAM Total']})"
         
-        # Format Swap usage with color
+        # Format Swap usage with dynamic color
         swap_usage = system_info['Swap Used'].split('(')[-1].strip(')')
-        swap_color = get_color_for_value(swap_usage, SWAP_THRESHOLDS)
+        swap_val = float(swap_usage.strip('%'))
+        swap_style = "green" if swap_val < 30 else "yellow" if swap_val < 60 else "red"
         
-        # Create horizontal system stats layout
-        system_stats = (
-            f"CPU: {cpu_color}{cpu_usage}{RESET} @ {cpu_freq} | "
-            f"RAM: {ram_color}{system_info['RAM Usage']}{RESET} "
-            f"({ram_used}/{ram_total}) | "
-            f"Swap: {swap_color}{swap_usage}{RESET}"
-        )
+        # Create the system stats line with rich Text objects
+        system_stats = Text()
+        system_stats.append("CPU: ", style="bold")
+        system_stats.append(f"{cpu_usage} @ {cpu_freq}", style=cpu_style)
+        system_stats.append(" | ", style="white")
+        system_stats.append("RAM: ", style="bold")
+        system_stats.append(ram_text, style=ram_style)
+        system_stats.append(" | ", style="white")
+        system_stats.append("Swap: ", style="bold")
+        system_stats.append(swap_usage, style=swap_style)
         
-        # Get system status message and color
+        # Get system status with emoji
         status_msg, status_color = get_system_status(system_info)
+        status_emoji = "✅ " if status_color == GREEN else "⚠️ " if status_color == YELLOW else "🔴 "
+        status_text = Text()
+        status_text.append(status_emoji)
+        status_text.append(status_msg, style=status_color.replace('\033', ''))
         
-        # Add system usage section with border
-        table.add_row("┌" + "─" * 78 + "┐")
-        table.add_row(f"│ {system_stats}" + " " * (77 - len(system_stats)) + "│")
-        table.add_row("└" + "─" * 78 + "┘")
+        # Parse GPU info and create GPU panel
+        gpu_parts = gpu_info.split('│')
+        if len(gpu_parts) >= 3:
+            temp = gpu_parts[1].strip()
+            vram = gpu_parts[2].strip()
+            usage = gpu_parts[3].strip() if len(gpu_parts) > 3 else "N/A"
+            
+            gpu_text = Text()
+            gpu_text.append("Temperature: ", style="bold cyan")
+            gpu_text.append(temp)
+            gpu_text.append(" | ", style="white")
+            gpu_text.append("VRAM: ", style="bold cyan")
+            gpu_text.append(vram)
+            gpu_text.append(" | ", style="white")
+            gpu_text.append("Usage: ", style="bold cyan")
+            gpu_text.append(usage)
+        else:
+            gpu_text = Text(gpu_info)
         
-        # Add status message
-        table.add_row(f"{status_color}{status_msg}{RESET}")
+        # Add content to table
+        table.add_row("")  # Spacing
+        table.add_row(Panel(system_stats, title="System Information", border_style="cyan"))
+        table.add_row(status_text)
+        table.add_row("")  # Spacing
+        table.add_row(Panel(gpu_text, title="GPU Information", border_style="magenta"))
+        table.add_row("")  # Spacing
         
-        # Add separator before GPU info
-        table.add_row("─" * 80)
+        # Create footer with update time
+        current_time = time.strftime("%H:%M:%S")
+        footer = Text()
+        footer.append("Last Update: ", style="dim")
+        footer.append(current_time, style="bright_black")
+        footer.append(" | ", style="dim")
+        footer.append(f"Refresh Interval: {self.interval} seconds", style="bright_black")
+        table.add_row(footer)
         
-        # Add GPU information
-        table.add_row(gpu_info)
-
         return Panel(
             table,
-            title="Monitoring Dashboard",
-            subtitle=f"Updated every {self.interval} seconds",
-            border_style="bright_blue"
+            title="[bold blue]ROCM MON[/bold blue]",
+            border_style="bright_blue",
+            padding=(0, 1)
         )
     
     def update_dashboard(self) -> Panel:
@@ -275,7 +312,7 @@ def show_ascii_art() -> None:
     ascii_art = r"""
 ██████╗  ██████╗  ██████╗███╗   ███╗
 ██╔══██╗██╔═══██╗██╔════╝████╗ ████║
-██████╔╝██║   ██║██║     ██╔████╔██║
+██████╔╝██║   ██║██║     ██╔██��█╔██║
 ██╔══██╗██║   ██║██║     ██║╚██╔╝██║
 ██║  ██║╚██████╔╝╚██████╗██║ ╚═╝ ██║
 ╚═╝  ╚═╝ ╚═════╝  ╚═════╝╚═╝     ╚═╝
