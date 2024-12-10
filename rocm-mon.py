@@ -335,7 +335,11 @@ def setup_logging(log_file: Optional[str]) -> None:
 
 
 def get_rocm_smi_output() -> str:
-    """Execute the rocm-smi command and return its output."""
+    """Execute the rocm-smi command and extract GPU stats.
+    
+    Returns:
+        str: Formatted string containing GPU usage, VRAM usage, and temperature
+    """
     try:
         result = subprocess.run(
             ['rocm-smi'],
@@ -343,8 +347,38 @@ def get_rocm_smi_output() -> str:
             text=True,
             check=True
         )
-        logger.debug("rocm-smi output:\n%s", result.stdout)
-        return result.stdout
+        
+        # Parse the output to extract relevant information
+        lines = result.stdout.strip().split('\n')
+        stats = None
+        
+        # Find the line with actual GPU stats (contains % and °C)
+        for line in lines:
+            if '°C' in line and '%' in line:
+                stats = line.strip()
+                break
+        
+        if not stats:
+            return "Error: Could not find GPU statistics in rocm-smi output"
+        
+        # Extract values using string splitting and indexing
+        # The line format is consistent, so we can split by whitespace
+        parts = [p for p in stats.split() if p]
+        
+        # Extract temperature (format: XX.X°C)
+        temp = next((p for p in parts if '°C' in p), 'N/A')
+        # Extract VRAM% (format: XX%)
+        vram = next((p for p in parts if '%' in p), 'N/A')
+        # Extract GPU% (last percentage in the line)
+        gpu = parts[-1] if parts else 'N/A'
+        
+        # Format the output
+        return (
+            f"GPU Stats │ Temperature: {temp} │ "
+            f"VRAM Usage: {vram} │ "
+            f"GPU Usage: {gpu}"
+        )
+        
     except FileNotFoundError:
         logger.error(
             "`rocm-smi` command not found. "
