@@ -41,6 +41,46 @@ BYTE_UNITS: list[str] = ["", "K", "M", "G", "T", "P"]
 BYTES_FACTOR: int = 1024
 SEPARATOR_LINE: str = "─" * 50
 
+# Color constants
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+RESET = "\033[0m"
+
+# Thresholds for color coding
+CPU_THRESHOLDS = {"low": 50, "medium": 80}  # percentage
+RAM_THRESHOLDS = {"low": 60, "medium": 80}  # percentage
+SWAP_THRESHOLDS = {"low": 30, "medium": 60}  # percentage
+
+def get_color_for_value(value: float, thresholds: dict[str, float]) -> str:
+    """Return ANSI color code based on value and thresholds."""
+    try:
+        value_float = float(value.strip('%'))
+        if value_float <= thresholds["low"]:
+            return GREEN
+        elif value_float <= thresholds["medium"]:
+            return YELLOW
+        return RED
+    except (ValueError, AttributeError):
+        return ""
+
+def get_system_status(system_info: Mapping[str, str]) -> tuple[str, str]:
+    """Generate a status message and color based on system metrics."""
+    try:
+        cpu_val = float(system_info["CPU Usage"].split('%')[0])
+        ram_val = float(system_info["RAM Usage"].strip('%'))
+        status_color = GREEN
+        
+        if cpu_val > CPU_THRESHOLDS["medium"] or ram_val > RAM_THRESHOLDS["medium"]:
+            status_color = RED
+            return "System under heavy load! Check resource usage.", status_color
+        elif cpu_val > CPU_THRESHOLDS["low"] or ram_val > RAM_THRESHOLDS["low"]:
+            status_color = YELLOW
+            return "System experiencing moderate load.", status_color
+        return "System running normally. All metrics within safe limits.", status_color
+    except (ValueError, KeyError):
+        return "Unable to determine system status.", ""
+
 # Configure logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -157,18 +197,45 @@ class SystemMonitor:
             Panel: Rich panel object containing the formatted dashboard
         """
         table = Table(title="System Monitor", box=box.ROUNDED, expand=True)
-        table.add_column("System Usage", style="magenta")
+        table.add_column("System Information", style="magenta")
         
-        cpu_ram = (
-            f"CPU Usage: {system_info['CPU Usage']}\n"
-            f"RAM Usage: {system_info['RAM Usage']} "
-            f"({system_info['RAM Used']} used / "
-            f"{system_info['RAM Available']} available)\n"
-            f"Swap Used: {system_info['Swap Used']}"
+        # Format CPU usage with color
+        cpu_usage = system_info['CPU Usage'].split('@')[0].strip()
+        cpu_freq = system_info['CPU Usage'].split('@')[1].strip() if '@' in system_info['CPU Usage'] else ""
+        cpu_color = get_color_for_value(cpu_usage, CPU_THRESHOLDS)
+        
+        # Format RAM usage with color
+        ram_color = get_color_for_value(system_info['RAM Usage'], RAM_THRESHOLDS)
+        ram_used = system_info['RAM Used']
+        ram_total = system_info['RAM Total']
+        
+        # Format Swap usage with color
+        swap_usage = system_info['Swap Used'].split('(')[-1].strip(')')
+        swap_color = get_color_for_value(swap_usage, SWAP_THRESHOLDS)
+        
+        # Create horizontal system stats layout
+        system_stats = (
+            f"CPU: {cpu_color}{cpu_usage}{RESET} @ {cpu_freq} | "
+            f"RAM: {ram_color}{system_info['RAM Usage']}{RESET} "
+            f"({ram_used}/{ram_total}) | "
+            f"Swap: {swap_color}{swap_usage}{RESET}"
         )
         
-        table.add_row(cpu_ram)
-        table.add_row(SEPARATOR_LINE)
+        # Get system status message and color
+        status_msg, status_color = get_system_status(system_info)
+        
+        # Add system usage section with border
+        table.add_row("┌" + "─" * 78 + "┐")
+        table.add_row(f"│ {system_stats}" + " " * (77 - len(system_stats)) + "│")
+        table.add_row("└" + "─" * 78 + "┘")
+        
+        # Add status message
+        table.add_row(f"{status_color}{status_msg}{RESET}")
+        
+        # Add separator before GPU info
+        table.add_row("─" * 80)
+        
+        # Add GPU information
         table.add_row(gpu_info)
 
         return Panel(
