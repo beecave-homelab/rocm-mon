@@ -143,22 +143,31 @@ class SystemMonitor:
         self.console = console or Console(theme=THEME)
 
     @staticmethod
-    def _progress(label: str, percent: float, style: str) -> Progress:
+    def _progress(
+        label: str, percent: float, style: str, value_text: str | None = None
+    ) -> Progress:
         """Create a horizontal gauge for ``percent`` with a label.
 
         Args:
             label: Metric label.
             percent: Percentage value 0-100.
             style: Rich style name for the gauge color.
+            value_text: Optional text to display at the right instead of
+                the default percentage (e.g., "36.0°C").
 
         Returns:
             A configured Progress renderable with a single task.
 
         """
+        right = (
+            TextColumn(value_text, justify="right")
+            if value_text is not None
+            else TextColumn("{task.percentage:>4.0f}%")
+        )
         prog = Progress(
             TextColumn(f"[bold]{label}[/]"),
             BarColumn(bar_width=None, style=style, complete_style=style),
-            TextColumn("{task.percentage:>4.0f}%"),
+            right,
             expand=True,
         )
         prog.add_task("", total=100, completed=max(0, min(100, int(percent))))
@@ -241,15 +250,17 @@ class SystemMonitor:
                 "Swap Used": "N/A",
             }
 
+    
+
     def create_dashboard(
         self,
-        gpu_info: Mapping[str, str],
+        gpu_infos: list[Mapping[str, str]],
         system_info: Mapping[str, str],
     ) -> Panel:
         """Create a rich Panel containing system information.
 
         Args:
-            gpu_info: String containing GPU information from rocm-smi
+            gpu_infos: List of per-GPU info mappings
             system_info: Dictionary containing CPU and RAM usage information
 
         Returns:
@@ -318,76 +329,98 @@ class SystemMonitor:
             padding=(1, 1),
         )
 
-        # GPU block
-        if gpu_info.get("error"):
-            gpu_content = Text(gpu_info["error"], style="alert")
-        else:
-            gpu_prog = self._progress(
-                "GPU",
-                float(gpu_info.get("gpu_percent", 0.0)),
-                style_for_percent(
-                    float(gpu_info.get("gpu_percent", 0.0)), CPU_THRESHOLDS
-                ),
-            )
-            vram_prog = self._progress(
-                (
-                    "VRAM ("
-                    f"{gpu_info.get('vram_used', 'N/A')}/"
-                    f"{gpu_info.get('vram_total', 'N/A')}"
-                    ")"
-                ),
-                float(gpu_info.get("vram_percent", 0.0)),
-                style_for_percent(
-                    float(gpu_info.get("vram_percent", 0.0)), RAM_THRESHOLDS
-                ),
-            )
-            temp_c = float(gpu_info.get("temp_c", 0.0))
-            temp_pct = min(100.0, (temp_c / TEMP_THRESHOLDS["medium"]) * 100.0)
-            temp_prog = self._progress(
-                "Temp",
-                temp_pct,
-                style_for_percent(temp_c, TEMP_THRESHOLDS),
-            )
-            temp_text = Text(
-                f"{temp_c:.1f}°C",
-                style=style_for_percent(temp_c, TEMP_THRESHOLDS),
-            )
+        # GPU blocks (multi-GPU aware)
+        gpu_panels: list[Panel] = []
+        for idx, gpu_info in enumerate(gpu_infos):
+            if gpu_info.get("error"):
+                gpu_content = Text(gpu_info["error"], style="alert")
+            else:
+                gpu_prog = self._progress(
+                    "GPU",
+                    float(gpu_info.get("gpu_percent", 0.0)),
+                    style_for_percent(
+                        float(gpu_info.get("gpu_percent", 0.0)), CPU_THRESHOLDS
+                    ),
+                )
+                vram_prog = self._progress(
+                    (
+                        "VRAM ("
+                        f"{gpu_info.get('vram_used', 'N/A')}/"
+                        f"{gpu_info.get('vram_total', 'N/A')}"
+                        ")"
+                    ),
+                    float(gpu_info.get("vram_percent", 0.0)),
+                    style_for_percent(
+                        float(gpu_info.get("vram_percent", 0.0)), RAM_THRESHOLDS
+                    ),
+                )
+                temp_c = float(gpu_info.get("temp_c", 0.0))
+                temp_pct = min(100.0, (temp_c / TEMP_THRESHOLDS["medium"]) * 100.0)
+                temp_prog = self._progress(
+                    "Temp",
+                    temp_pct,
+                    style_for_percent(temp_c, TEMP_THRESHOLDS),
+                    value_text=f"{temp_c:.1f}°C",
+                )
 
-            meta = Text(
-                gpu_info.get("name", "GPU"),
-                style="muted",
-            )
-            gtable = Table.grid(padding=(0, 1))
-            gtable.add_row(meta)
-            gtable.add_row(gpu_prog)
-            gtable.add_row(vram_prog)
-            gtable.add_row(Group(temp_prog, temp_text))
-            # Optional: show per-process info if available
-            procs = gpu_info.get("processes") or []
-            if procs:
-                ptable = Table.grid(padding=(0, 1))
-                # Header row
-                header = Text("PID    NAME           GPU  VRAM", style="muted")
-                ptable.add_row(header)
-                # Show up to 5 processes to keep the panel compact
-                for proc in procs[:5]:
-                    pid = str(proc.get("pid", "-"))
-                    name = str(proc.get("name", "-"))[:14]
-                    gpus = str(proc.get("gpus", "-"))
-                    vram = str(proc.get("vram_used", "-"))
-                    row = Text(f"{pid:>5}  {name:<14}  {gpus:>3}  {vram:>6}")
-                    ptable.add_row(row)
-                gtable.add_row(Text("Processes", style="bold"))
-                gtable.add_row(ptable)
-            gpu_content = gtable
+                meta = Text(
+                    f"GPU {gpu_info.get('id', idx)}  {gpu_info.get('name', 'AMD GPU')}",
+                    style="muted",
+                )
+                gtable = Table.grid(padding=(0, 1))
+                gtable.add_row(meta)
+                gtable.add_row(gpu_prog)
+                gtable.add_row(vram_prog)
+                gtable.add_row(temp_prog)
+                # Optional: show per-process info if available
+                procs = gpu_info.get("processes") or []
+                if procs:
+                    ptable = Table.grid(expand=True)
+                    # Create fixed columns to prevent wrapping and misalignment
+                    ptable.add_column(justify="right", ratio=1)
+                    ptable.add_column(justify="left", ratio=3)
+                    ptable.add_column(justify="right", ratio=1)
+                    ptable.add_column(justify="right", ratio=2)
+                    # Header row
+                    ptable.add_row(
+                        Text("PID", style="muted"),
+                        Text("NAME", style="muted"),
+                        Text("GPU", style="muted"),
+                        Text("VRAM", style="muted"),
+                    )
+                    # Sort by VRAM used desc when numeric
+                    def _vram_key(p: dict[str, str]) -> int:
+                        try:
+                            return int(p.get("vram_used", "0"))
+                        except Exception:
+                            return 0
 
-        gpu_panel = Panel.fit(
-            gpu_content,
-            title="GPU",
-            border_style="gpu.border",
-            box=box.ROUNDED,
-            padding=(1, 1),
-        )
+                    procs_sorted = sorted(procs, key=_vram_key, reverse=True)
+                    # Show up to 8 processes to keep the panel compact
+                    for proc in procs_sorted[:8]:
+                        pid = str(proc.get("pid", "-"))
+                        name = str(proc.get("name", "-"))[:18]
+                        gpus_str = str(proc.get("gpus", "-"))
+                        vram_raw = str(proc.get("vram_used", "-"))
+                        # Pretty VRAM if numeric
+                        try:
+                            vram_val = int(vram_raw)
+                            vram_disp = SystemMonitor.get_size(vram_val)
+                        except Exception:
+                            vram_disp = vram_raw
+                        ptable.add_row(pid, name, gpus_str, vram_disp)
+                    gtable.add_row(Text("Processes", style="bold"))
+                    gtable.add_row(ptable)
+                gpu_content = gtable
+
+            gpu_panel = Panel.fit(
+                gpu_content,
+                title="GPU",
+                border_style="gpu.border",
+                box=box.ROUNDED,
+                padding=(1, 1),
+            )
+            gpu_panels.append(gpu_panel)
 
         # Layout
         layout = Layout()
@@ -405,7 +438,9 @@ class SystemMonitor:
         body = Table.grid(expand=True)
         body.add_column(ratio=1)
         body.add_column(ratio=1)
-        body.add_row(sys_panel, gpu_panel)
+        # Stack GPU panels vertically in the right column
+        right_group = Group(*gpu_panels)
+        body.add_row(sys_panel, right_group)
         layout["header"].update(
             Panel(
                 header_group,
@@ -435,12 +470,9 @@ class SystemMonitor:
             Panel: The rendered dashboard panel ready for display.
 
         """
-        gpu_info = get_rocm_smi_output()
+        gpu_infos = get_all_gpu_info()
         system_info = self.get_cpu_ram_usage()
-        return self.create_dashboard(
-            gpu_info,
-            system_info,
-        )
+        return self.create_dashboard(gpu_infos, system_info)
 
     def run(self) -> None:
         """Run the system monitor."""
@@ -460,7 +492,8 @@ class SystemMonitor:
             else:
                 # Compact, single render (TTY-small or non-TTY)
                 sys_info = self.get_cpu_ram_usage()
-                gpu = get_rocm_smi_output()
+                gpus = get_all_gpu_info()
+                gpu = gpus[0] if gpus else {"error": "No GPU found"}
                 self.console.print(self.render_compact_line(sys_info, gpu))
         except KeyboardInterrupt:
             logger.info("System monitor terminated by user.")
@@ -597,9 +630,68 @@ def get_rocm_smi_output() -> dict[str, str]:
             if "°C" in line and "%" in line:
                 stats = line.strip()
                 break
-
         if not stats:
-            return {"error": "Could not find GPU statistics in rocm-smi output"}
+            # JSON fallback: get temp and gpu use directly
+            try:
+                js = subprocess.run(
+                    ["rocm-smi", "--json", "--showtemp", "--showuse"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                data = json.loads(js.stdout or "{}")
+                # Walk for temperature and usage
+                temp_c = 0.0
+                gpu_use = 0.0
+
+                def _walk(obj: object) -> None:
+                    nonlocal temp_c, gpu_use
+                    if isinstance(obj, dict):
+                        for k, v in obj.items():
+                            kl = str(k).lower()
+                            if isinstance(v, (dict, list)):
+                                _walk(v)
+                            else:
+                                if "temp" in kl and "c" in str(v).lower():
+                                    try:
+                                        temp_c = float(
+                                            str(v).replace("°C", "").replace("C", "")
+                                        )
+                                    except Exception:
+                                        pass
+                                if kl.endswith("gpu use (%)") or (
+                                    "gpu use" in kl and "%" in str(v)
+                                ):
+                                    try:
+                                        gpu_use = float(str(v).replace("%", ""))
+                                    except Exception:
+                                        pass
+                    elif isinstance(obj, list):
+                        for it in obj:
+                            _walk(it)
+
+                _walk(data)
+                # Compute VRAM percent from meminfo
+                used_b, total_b = get_rocm_smi_vram_usage_bytes()
+                vram_pct = 0.0
+                if used_b is not None and total_b:
+                    vram_pct = (used_b / total_b) * 100.0
+                # Build info
+                info = {
+                    "temp_c": f"{temp_c}",
+                    "gpu_percent": f"{gpu_use}",
+                    "vram_percent": f"{vram_pct}",
+                    "vram_used": SystemMonitor.get_size(used_b)
+                    if used_b is not None
+                    else "N/A",
+                    "vram_total": SystemMonitor.get_size(total_b)
+                    if total_b is not None
+                    else "N/A",
+                    "name": "AMD GPU",
+                }
+                return info
+            except Exception:
+                return {"error": "Could not find GPU statistics in rocm-smi output"}
 
         # Extract values using string splitting and indexing
         # The concise row contains multiple percentage fields; the last two
@@ -683,19 +775,80 @@ def get_rocm_smi_processes() -> list[dict[str, str]]:
         are detected or output is not parseable.
 
     """
+    # Strategy 0: JSON verbose if available (most robust)
+    try:
+        js = subprocess.run(
+            ["rocm-smi", "--json", "--showpids", "VERBOSE"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        data = json.loads(js.stdout or "{}")
+        processes: list[dict[str, str]] = []
+
+        def _walk(obj: object) -> None:
+            if isinstance(obj, dict):
+                # Attempt to detect a process dict
+                keys = {k.lower() for k in obj.keys()}
+                if any(k in keys for k in ("pid", "process name", "process")):
+                    pid_val = obj.get("PID") or obj.get("pid")
+                    name_val = (
+                        obj.get("PROCESS NAME")
+                        or obj.get("Process Name")
+                        or obj.get("name")
+                    )
+                    gpus_val = obj.get("GPU(s)") or obj.get("gpus")
+                    vram_val = (
+                        obj.get("VRAM USED")
+                        or obj.get("VRAM Used")
+                        or obj.get("vram_used")
+                    )
+                    # Ensure pid looks numeric
+                    try:
+                        if pid_val is not None and str(pid_val).isdigit():
+                            processes.append(
+                                {
+                                    "pid": str(pid_val),
+                                    "name": (
+                                        str(name_val) if name_val is not None else "-"
+                                    ),
+                                    "gpus": (
+                                        str(gpus_val) if gpus_val is not None else "-"
+                                    ),
+                                    "vram_used": (
+                                        str(vram_val) if vram_val is not None else "-"
+                                    ),
+                                }
+                            )
+                            return
+                    except Exception:
+                        pass
+                for v in obj.values():
+                    _walk(v)
+            elif isinstance(obj, list):
+                for it in obj:
+                    _walk(it)
+
+        _walk(data)
+        # If we found any via JSON, return them
+        # Don't return yet; we'll also parse text and merge to avoid misses
+    except Exception:
+        pass
+
+    # Text parsing (also used to merge with JSON results)
     try:
         result = subprocess.run(
             ["rocm-smi", "--showpids"], capture_output=True, text=True, check=True
         )
     except FileNotFoundError:
-        return []
+        return processes if 'processes' in locals() else []
 
     text_out = result.stdout or ""
     lines = [ln.rstrip() for ln in text_out.splitlines() if ln.strip()]
+    if 'processes' not in locals():
+        processes = []
     if not lines:
-        return []
-
-    processes: list[dict[str, str]] = []
+        return processes
 
     # Strategy A: Table format with header including PID/PROCESS
     header_idx = -1
@@ -721,19 +874,56 @@ def get_rocm_smi_processes() -> list[dict[str, str]]:
             gpus = cols[2] if len(cols) > 2 else "-"
             vram = cols[3] if len(cols) > 3 else "-"
             if pid.isdigit():
-                processes.append(
-                    {
-                        "pid": pid,
-                        "name": name,
-                        "gpus": gpus,
-                        "vram_used": vram,
-                    }
-                )
-        if processes:
-            return processes
+                if not any(p.get("pid") == pid for p in processes):
+                    processes.append(
+                        {
+                            "pid": pid,
+                            "name": name,
+                            "gpus": gpus,
+                            "vram_used": vram,
+                        }
+                    )
+
+    # Merge JSON and text parsing results
+    kv_pid = re.compile(r"PID\s+(?P<pid>\d+)", re.I)
+    kv_name = re.compile(r"PROCESS NAME\s+(?P<name>\S+)", re.I)
+    kv_gpus = re.compile(r"GPU\(s\)\s+(?P<gpus>\S+)", re.I)
+    kv_vram = re.compile(r"VRAM\s+USED\s+(?P<vram>\d+)", re.I)
+    for ln in lines:
+        mp = kv_pid.search(ln)
+        if not mp:
+            continue
+        pid = mp.group("pid")
+        name = kv_name.search(ln)
+        gpus = kv_gpus.search(ln)
+        vram = kv_vram.search(ln)
+        entry = {
+            "pid": pid,
+            "name": name.group("name") if name else "-",
+            "gpus": gpus.group("gpus") if gpus else "-",
+            "vram_used": vram.group("vram") if vram else "-",
+        }
+        # Merge by PID (avoid duplicates)
+        if not any(p.get("pid") == pid for p in processes):
+            processes.append(entry)
+
+    # Sort by VRAM used desc when numeric
+    def sort_key(p: dict[str, str]) -> tuple[bool, int]:
+        try:
+            vram_used = float(p["vram_used"])
+            return (False, -int(vram_used))
+        except Exception:
+            return (True, 0)
+
+    processes.sort(key=sort_key)
+
+    # Show up to 8 rows
+    return processes[:8]
 
 
-def get_rocm_smi_vram_usage_bytes() -> tuple[int | None, int | None]:
+def get_rocm_smi_vram_usage_bytes(
+    device_id: int | None = None,
+) -> tuple[int | None, int | None]:
     """Return VRAM used and total in bytes via ``rocm-smi --showmeminfo vram``.
 
     The function tries JSON output first, then falls back to text parsing
@@ -759,8 +949,12 @@ def get_rocm_smi_vram_usage_bytes() -> tuple[int | None, int | None]:
 
     # Attempt JSON first
     try:
+        cmd = ["rocm-smi", "--json", "--showmeminfo", "vram"]
+        if device_id is not None:
+            cmd = ["rocm-smi", "-d", str(device_id), "--json", "--showmeminfo",
+                   "vram"]
         res = subprocess.run(
-            ["rocm-smi", "--json", "--showmeminfo", "vram"],
+            cmd,
             capture_output=True,
             text=True,
             check=True,
@@ -800,8 +994,11 @@ def get_rocm_smi_vram_usage_bytes() -> tuple[int | None, int | None]:
 
     # Text fallback
     try:
+        cmd = ["rocm-smi", "--showmeminfo", "vram"]
+        if device_id is not None:
+            cmd = ["rocm-smi", "-d", str(device_id), "--showmeminfo", "vram"]
         res = subprocess.run(
-            ["rocm-smi", "--showmeminfo", "vram"],
+            cmd,
             capture_output=True,
             text=True,
             check=True,
@@ -844,6 +1041,194 @@ def get_rocm_smi_vram_usage_bytes() -> tuple[int | None, int | None]:
             used_b_txt = _to_bytes(m_used_u.group(1))
 
     return used_b_txt, total_b_txt
+
+
+def detect_gpu_ids() -> list[int]:
+    """Detect available GPU numeric IDs using rocm-smi JSON or text fallback.
+
+    Returns:
+        List of GPU indices, e.g. [0], [0, 1], etc.
+    """
+    # JSON: showid returns cards as keys
+    try:
+        res = subprocess.run(
+            ["rocm-smi", "--json", "--showid"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        data = json.loads(res.stdout or "{}")
+        ids: list[int] = []
+        for k in data.keys():
+            if str(k).startswith("card"):
+                try:
+                    ids.append(int(str(k).replace("card", "")))
+                except Exception:
+                    continue
+        if ids:
+            return sorted(ids)
+    except Exception:
+        pass
+    # Fallback: parse concise text for Device rows and count
+    try:
+        res = subprocess.run(["rocm-smi"], capture_output=True, text=True, check=True)
+        count = sum(1 for ln in (res.stdout or "").splitlines() if ln.startswith("0 ")
+                   )
+        # above heuristic is weak; instead search for lines starting with digit
+        if count == 0:
+            count = sum(
+                1
+                for ln in (res.stdout or "").splitlines()
+                if re.match(r"^\d+\s+", ln)
+            )
+        return list(range(count)) if count > 0 else [0]
+    except Exception:
+        return [0]
+
+
+def get_rocm_smi_pid_gpu_map() -> dict[str, list[str]]:
+    """Return mapping pid -> list of GPU IDs using showpidgpus if available.
+
+    Returns:
+        Dict mapping str(pid) to list of GPU id strings.
+    """
+    # JSON first
+    mapping: dict[str, list[str]] = {}
+    try:
+        res = subprocess.run(
+            ["rocm-smi", "--json", "--showpidgpus"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        data = json.loads(res.stdout or "{}")
+        # look for structures like { pid: { "GPU(s)": "0,1" } }
+        def _walk(obj: object) -> None:
+            if isinstance(obj, dict):
+                if "GPU(s)" in obj and any(k.lower() == "pid" for k in obj):
+                    pid_val = obj.get("pid") or obj.get("PID")
+                    g = str(obj.get("GPU(s)", "")).replace(" ", "")
+                    if pid_val is not None:
+                        mapping[str(pid_val)] = g.split(",") if g else []
+                for v in obj.values():
+                    _walk(v)
+            elif isinstance(obj, list):
+                for it in obj:
+                    _walk(it)
+        _walk(data)
+        if mapping:
+            return mapping
+    except Exception:
+        pass
+    # Text fallback
+    try:
+        res = subprocess.run(
+            ["rocm-smi", "--showpidgpus"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        lines = [ln for ln in (res.stdout or "").splitlines() if ln.strip()]
+        for ln in lines:
+            m = re.search(r"PID\s+(\d+).*?GPU\(s\)\s+([\d,]+)", ln)
+            if m:
+                mapping[m.group(1)] = m.group(2).split(",")
+    except Exception:
+        pass
+    return mapping
+
+
+def get_rocm_smi_output_for(device_id: int) -> dict[str, str]:
+    """Get concise GPU stats for a specific device id using rocm-smi.
+
+    Args:
+        device_id: Numeric GPU id to query (-d flag)
+
+    Returns:
+        Mapping with temp, gpu_percent, vram_percent, vram used/total and name.
+    """
+    try:
+        result = subprocess.run(
+            ["rocm-smi", "-d", str(device_id)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        lines = result.stdout.strip().split("\n")
+        stats = None
+        for line in lines:
+            if "°C" in line and "%" in line:
+                # Require at least two percentage tokens on the line
+                pct_tokens = [p for p in line.split() if p.endswith('%')]
+                if len(pct_tokens) >= 2:
+                    stats = line.strip()
+                    break
+        if not stats:
+            return {"error": "Could not find GPU statistics in rocm-smi output"}
+        parts = [p for p in stats.split() if p]
+        temp_token = next((p for p in parts if "°C" in p), "N/A")
+        percent_tokens = [p for p in parts if p.endswith("%")]
+        if len(percent_tokens) >= 2:
+            vram_pct_token = percent_tokens[-2]
+            gpu_pct_token = percent_tokens[-1]
+        else:
+            vram_pct_token = "0%"
+            gpu_pct_token = percent_tokens[-1] if percent_tokens else "0%"
+
+        def pct_to_float(s: str) -> float:
+            try:
+                return float(s.replace("%", ""))
+            except Exception:
+                return 0.0
+
+        try:
+            temp_c = float(temp_token.replace("°C", "").replace("C", ""))
+        except Exception:
+            temp_c = 0.0
+
+        info: dict[str, str | list[dict[str, str]]]
+        info = {
+            "id": str(device_id),
+            "temp_c": f"{temp_c}",
+            "gpu_percent": f"{pct_to_float(gpu_pct_token)}",
+            "vram_percent": f"{pct_to_float(vram_pct_token)}",
+            "vram_used": "N/A",
+            "vram_total": "N/A",
+            "name": "AMD GPU",
+        }
+        # VRAM totals
+        try:
+            used_b, total_b = get_rocm_smi_vram_usage_bytes(device_id)
+            if used_b is not None and total_b is not None and total_b > 0:
+                info["vram_used"] = SystemMonitor.get_size(used_b)
+                info["vram_total"] = SystemMonitor.get_size(total_b)
+        except Exception as e:  # pragma: no cover
+            logger.debug("VRAM meminfo failed for GPU %s: %s", device_id, e)
+        return info  # type: ignore[return-value]
+    except Exception as e:
+        logger.error("Failed rocm-smi for device %s: %s", device_id, e)
+        return {"error": f"GPU {device_id} query failed"}
+
+
+def get_all_gpu_info() -> list[dict[str, str]]:
+    """Collect GPU info using plain rocm-smi and attach processes.
+
+    Returns:
+        Single-element list with GPU info dict including 'id' and 'processes'.
+
+    """
+    info = get_rocm_smi_output()
+    # Ensure required keys
+    if "id" not in info:
+        info["id"] = "0"
+    # Attach all processes (unfiltered) for now
+    try:
+        procs = get_rocm_smi_processes()
+        if procs:
+            info["processes"] = procs
+    except Exception:
+        pass
+    return [info]
 
 
 def check_system_compatibility() -> None:
