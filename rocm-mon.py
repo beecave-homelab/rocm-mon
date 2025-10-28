@@ -1,5 +1,4 @@
-#!venv/bin/python3
-# #!/usr/bin/env python3
+#!/usr/bin/env python3
 
 """ROCm System Monitor.
 
@@ -28,11 +27,14 @@ from collections.abc import Mapping
 import click
 import psutil
 from rich import box
-from rich.console import Console
+from rich.console import Console, Group
+from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
+from rich.progress import BarColumn, Progress, TextColumn
 from rich.table import Table
 from rich.text import Text
+from rich.theme import Theme
 
 # Constants
 DEFAULT_INTERVAL: int = 5
@@ -41,34 +43,45 @@ BYTE_UNITS: list[str] = ["", "K", "M", "G", "T", "P"]
 BYTES_FACTOR: int = 1024
 SEPARATOR_LINE: str = "─" * 50
 
-# Color constants
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
-RED = "\033[31m"
-RESET = "\033[0m"
+THEME = Theme(
+    {
+        "title": "bold bright_blue",
+        "muted": "bright_black",
+        "ok": "green",
+        "warn": "yellow",
+        "alert": "red",
+        "sys.border": "cyan",
+        "gpu.border": "magenta",
+    }
+)
 
 # Thresholds for color coding
 CPU_THRESHOLDS = {"low": 50, "medium": 80}  # percentage
 RAM_THRESHOLDS = {"low": 60, "medium": 80}  # percentage
 SWAP_THRESHOLDS = {"low": 30, "medium": 60}  # percentage
+TEMP_THRESHOLDS = {"low": 70, "medium": 85}  # Celsius
 
 
-def get_color_for_value(value: float, thresholds: dict[str, float]) -> str:
-    """Return ANSI color code based on value and thresholds.
+def style_for_percent(value: float, thresholds: dict[str, float]) -> str:
+    """Return a Rich style name based on ``value`` and percentage thresholds.
+
+    Args:
+        value: Numeric value (0-100 range expected for percentages).
+        thresholds: Mapping with "low" and "medium" cutoffs.
 
     Returns:
-        str: ANSI color code string for the provided value and thresholds.
+        A style name: "ok", "warn", or "alert".
 
     """
     try:
-        value_float = float(value.strip("%"))
-        if value_float <= thresholds["low"]:
-            return GREEN
-        elif value_float <= thresholds["medium"]:
-            return YELLOW
-        return RED
+        v = float(str(value).strip("%"))
     except (ValueError, AttributeError):
-        return ""
+        return "muted"
+    if v <= thresholds["low"]:
+        return "ok"
+    if v <= thresholds["medium"]:
+        return "warn"
+    return "alert"
 
 
 def get_system_status(system_info: Mapping[str, str]) -> tuple[str, str]:
@@ -81,17 +94,16 @@ def get_system_status(system_info: Mapping[str, str]) -> tuple[str, str]:
     try:
         cpu_val = float(system_info["CPU Usage"].split("%")[0])
         ram_val = float(system_info["RAM Usage"].strip("%"))
-        status_color = GREEN
-
+        style = "ok"
         if cpu_val > CPU_THRESHOLDS["medium"] or ram_val > RAM_THRESHOLDS["medium"]:
-            status_color = RED
-            return "System under heavy load! Check resource usage.", status_color
-        elif cpu_val > CPU_THRESHOLDS["low"] or ram_val > RAM_THRESHOLDS["low"]:
-            status_color = YELLOW
-            return "System experiencing moderate load.", status_color
-        return "System running normally. All metrics within safe limits.", status_color
+            style = "alert"
+            return "System under heavy load! Check resource usage.", style
+        if cpu_val > CPU_THRESHOLDS["low"] or ram_val > RAM_THRESHOLDS["low"]:
+            style = "warn"
+            return "System experiencing moderate load.", style
+        return "System running normally. All metrics within safe limits.", style
     except (ValueError, KeyError):
-        return "Unable to determine system status.", ""
+        return "Unable to determine system status.", "muted"
 
 
 # Configure logging
@@ -106,15 +118,49 @@ logger.addHandler(handler)
 class SystemMonitor:
     """Handle system monitoring operations."""
 
-    def __init__(self, interval: int = DEFAULT_INTERVAL) -> None:
+    def __init__(
+        self,
+        interval: int = DEFAULT_INTERVAL,
+        *,
+        compact: bool = False,
+        no_ascii: bool = False,
+        console: Console | None = None,
+    ) -> None:
         """Initialize the system monitor.
 
         Args:
             interval: Update interval in seconds
+            compact: Render compact single-line/device layout
+            no_ascii: Disable ASCII banner
+            console: Optional Console (to allow no-color or themed consoles)
 
         """
         self.interval = interval
-        self.console = Console()
+        self.compact = compact
+        self.no_ascii = no_ascii
+        self.console = console or Console(theme=THEME)
+
+    @staticmethod
+    def _progress(label: str, percent: float, style: str) -> Progress:
+        """Create a horizontal gauge for ``percent`` with a label.
+
+        Args:
+            label: Metric label.
+            percent: Percentage value 0-100.
+            style: Rich style name for the gauge color.
+
+        Returns:
+            A configured Progress renderable with a single task.
+
+        """
+        prog = Progress(
+            TextColumn(f"[bold]{label}[/]"),
+            BarColumn(bar_width=None, style=style, complete_style=style),
+            TextColumn("{task.percentage:>4.0f}%"),
+            expand=True,
+        )
+        prog.add_task("", total=100, completed=max(0, min(100, int(percent))))
+        return prog
 
     @staticmethod
     def get_size(bytes_value: int, suffix: str = "B") -> str:
@@ -193,7 +239,11 @@ class SystemMonitor:
                 "Swap Used": "N/A",
             }
 
-    def create_dashboard(self, gpu_info: str, system_info: Mapping[str, str]) -> Panel:
+    def create_dashboard(
+        self,
+        gpu_info: Mapping[str, str],
+        system_info: Mapping[str, str],
+    ) -> Panel:
         """Create a rich Panel containing system information.
 
         Args:
@@ -204,104 +254,154 @@ class SystemMonitor:
             Panel: Rich panel object containing the formatted dashboard
 
         """
-        # Create the main table
-        table = Table(box=box.ROUNDED, expand=True, show_header=False)
-        table.add_column("Content", justify="left", style="white")
+        # Header (include ASCII art inside header panel if enabled)
+        header_parts: list[Text] = []
+        if not self.no_ascii:
+            # Render only ASCII banner when enabled; center it in the header
+            header_parts.append(
+                Text(show_ascii_art(), style="bold green", justify="center")
+            )
+        else:
+            # Fallback: centered text title when ASCII is disabled
+            header_parts.append(Text("ROCM MON", style="title", justify="center"))
+        header_group = Group(*header_parts)
 
-        # Format CPU usage with dynamic color
-        cpu_usage = system_info["CPU Usage"].split("@")[0].strip()
+        # System block
+        cpu_usage_str = system_info["CPU Usage"].split("@")[0].strip()
         cpu_freq = (
             system_info["CPU Usage"].split("@")[1].strip()
             if "@" in system_info["CPU Usage"]
             else ""
         )
-        cpu_val = float(cpu_usage.strip("%"))
-        cpu_style = "green" if cpu_val < 50 else "yellow" if cpu_val < 80 else "red"
+        cpu_val = float(cpu_usage_str.strip("%"))
+        cpu_prog = self._progress(
+            "CPU",
+            cpu_val,
+            style_for_percent(cpu_val, CPU_THRESHOLDS),
+        )
 
-        # Format RAM usage with dynamic color
         ram_val = float(system_info["RAM Usage"].strip("%"))
-        ram_style = "green" if ram_val < 60 else "yellow" if ram_val < 80 else "red"
-        ram_text = (
-            f"{system_info['RAM Usage']} "
-            f"({system_info['RAM Used']}/{system_info['RAM Total']})"
+        ram_prog = self._progress(
+            f"RAM ({system_info['RAM Used']}/{system_info['RAM Total']})",
+            ram_val,
+            style_for_percent(ram_val, RAM_THRESHOLDS),
         )
 
-        # Format Swap usage with dynamic color
-        swap_usage = system_info["Swap Used"].split("(")[-1].strip(")")
-        swap_val = float(swap_usage.strip("%"))
-        swap_style = "green" if swap_val < 30 else "yellow" if swap_val < 60 else "red"
-
-        # Create the system stats line with rich Text objects
-        system_stats = Text()
-        system_stats.append("CPU: ", style="bold")
-        system_stats.append(f"{cpu_usage} @ {cpu_freq}", style=cpu_style)
-        system_stats.append(" | ", style="white")
-        system_stats.append("RAM: ", style="bold")
-        system_stats.append(ram_text, style=ram_style)
-        system_stats.append(" | ", style="white")
-        system_stats.append("Swap: ", style="bold")
-        system_stats.append(swap_usage, style=swap_style)
-
-        # Get system status with emoji
-        status_msg, status_color = get_system_status(system_info)
-        status_emoji = (
-            "✅ "
-            if status_color == GREEN
-            else "⚠️ "
-            if status_color == YELLOW
-            else "🔴 "
+        swap_pct_text = system_info["Swap Used"].split("(")[-1].strip(")")
+        swap_val = (
+            float(swap_pct_text.strip("%"))
+            if swap_pct_text.endswith("%")
+            else float(swap_pct_text)
         )
-        status_text = Text()
-        status_text.append(status_emoji)
-        style_plain = status_color.replace("\u001b", "")
-        status_text.append(status_msg, style=style_plain)
+        swap_prog = self._progress(
+            "Swap",
+            swap_val,
+            style_for_percent(swap_val, SWAP_THRESHOLDS),
+        )
 
-        # Parse GPU info and create GPU panel
-        gpu_parts = gpu_info.split("│")
-        if len(gpu_parts) >= 3:
-            temp = gpu_parts[1].strip()
-            vram = gpu_parts[2].strip()
-            usage = gpu_parts[3].strip() if len(gpu_parts) > 3 else "N/A"
+        sys_table = Table.grid(padding=(0, 1))
+        sys_table.add_row(cpu_prog)
+        if cpu_freq:
+            sys_table.add_row(Text(f"Frequency: {cpu_freq}", style="muted"))
+        sys_table.add_row(ram_prog)
+        sys_table.add_row(swap_prog)
 
-            gpu_text = Text()
-            gpu_text.append("Temperature: ", style="bold cyan")
-            gpu_text.append(temp)
-            gpu_text.append(" | ", style="white")
-            gpu_text.append("VRAM: ", style="bold cyan")
-            gpu_text.append(vram)
-            gpu_text.append(" | ", style="white")
-            gpu_text.append("Usage: ", style="bold cyan")
-            gpu_text.append(usage)
+        status_msg, status_style = get_system_status(system_info)
+        status_badge = Text.assemble((" ",), (status_msg, status_style))
+        sys_panel = Panel.fit(
+            Group(sys_table, status_badge),
+            title="System",
+            border_style="sys.border",
+            box=box.ROUNDED,
+            padding=(1, 1),
+        )
+
+        # GPU block
+        if gpu_info.get("error"):
+            gpu_content = Text(gpu_info["error"], style="alert")
         else:
-            gpu_text = Text(gpu_info)
+            gpu_prog = self._progress(
+                "GPU",
+                float(gpu_info.get("gpu_percent", 0.0)),
+                style_for_percent(
+                    float(gpu_info.get("gpu_percent", 0.0)), CPU_THRESHOLDS
+                ),
+            )
+            vram_prog = self._progress(
+                (
+                    "VRAM ("
+                    f"{gpu_info.get('vram_used', 'N/A')}/"
+                    f"{gpu_info.get('vram_total', 'N/A')}"
+                    ")"
+                ),
+                float(gpu_info.get("vram_percent", 0.0)),
+                style_for_percent(
+                    float(gpu_info.get("vram_percent", 0.0)), RAM_THRESHOLDS
+                ),
+            )
+            temp_c = float(gpu_info.get("temp_c", 0.0))
+            temp_pct = min(100.0, (temp_c / TEMP_THRESHOLDS["medium"]) * 100.0)
+            temp_prog = self._progress(
+                "Temp", temp_pct, style_for_percent(temp_c, TEMP_THRESHOLDS)
+            )
 
-        # Add content to table
-        table.add_row("")  # Spacing
-        table.add_row(
-            Panel(system_stats, title="System Information", border_style="cyan")
+            meta = Text(
+                gpu_info.get("name", "GPU"),
+                style="muted",
+            )
+            gtable = Table.grid(padding=(0, 1))
+            gtable.add_row(meta)
+            gtable.add_row(gpu_prog)
+            gtable.add_row(vram_prog)
+            gtable.add_row(temp_prog)
+            gpu_content = gtable
+
+        gpu_panel = Panel.fit(
+            gpu_content,
+            title="GPU",
+            border_style="gpu.border",
+            box=box.ROUNDED,
+            padding=(1, 1),
         )
-        table.add_row(status_text)
-        table.add_row("")  # Spacing
-        table.add_row(Panel(gpu_text, title="GPU Information", border_style="magenta"))
-        table.add_row("")  # Spacing
 
-        # Create footer with update time
+        # Layout
+        layout = Layout()
+        # Determine a compact header height (ASCII lines + title line)
+        ascii_lines = 0 if self.no_ascii else len(show_ascii_art().splitlines())
+        # Add extra breathing room (+3) so glyphs never clip against the border
+        header_lines = ascii_lines + 3  # +1 title +2 top/bottom space
+        header_size = max(6, min(10, header_lines))
+        layout.split_column(
+            Layout(name="header", size=header_size),
+            Layout(name="body"),
+            Layout(name="footer", size=1),
+        )
+        # Body as a two-column Table to keep minimal height and equal widths
+        body = Table.grid(expand=True)
+        body.add_column(ratio=1)
+        body.add_column(ratio=1)
+        body.add_row(sys_panel, gpu_panel)
+        layout["header"].update(
+            Panel(
+                header_group,
+                border_style="bright_blue",
+                box=box.SQUARE,
+                padding=(0, 1),
+            )
+        )
+        layout["body"].update(body)
+
+        # Footer
         current_time = time.strftime("%H:%M:%S")
-        footer = Text()
-        footer.append("Last Update: ", style="dim")
-        footer.append(current_time, style="bright_black")
-        footer.append(" | ", style="dim")
-        footer.append(
-            f"Refresh Interval: {self.interval} seconds", style="bright_black"
+        footer = Text.assemble(
+            ("Last Update: ", "muted"),
+            (current_time, "muted"),
+            (" | ", "muted"),
+            (f"Refresh Interval: {self.interval} seconds", "muted"),
         )
-        table.add_row(footer)
+        layout["footer"].update(footer)
 
-        return Panel(
-            table,
-            title="[bold blue]ROCM MON[/bold blue]",
-            border_style="bright_blue",
-            padding=(0, 1),
-        )
+        return Panel(layout, box=box.SIMPLE)
 
     def update_dashboard(self) -> Panel:
         """Gather all information and create the dashboard panel.
@@ -312,46 +412,105 @@ class SystemMonitor:
         """
         gpu_info = get_rocm_smi_output()
         system_info = self.get_cpu_ram_usage()
-        return self.create_dashboard(gpu_info, system_info)
+        return self.create_dashboard(
+            gpu_info,
+            system_info,
+        )
 
     def run(self) -> None:
         """Run the system monitor."""
         try:
-            with Live(
-                self.update_dashboard(), refresh_per_second=1, console=self.console
-            ) as live:
-                while True:
-                    dashboard = self.update_dashboard()
-                    live.update(dashboard)
-                    time.sleep(self.interval)
+            if self.console.is_terminal and not self.compact:
+                with Live(
+                    self.update_dashboard(),
+                    refresh_per_second=1,
+                    console=self.console,
+                ) as live:
+                    while True:
+                        dashboard = self.update_dashboard()
+                        live.update(dashboard)
+                        if getattr(self, "_once", False):
+                            break
+                        time.sleep(self.interval)
+            else:
+                # Compact, single render (TTY-small or non-TTY)
+                sys_info = self.get_cpu_ram_usage()
+                gpu = get_rocm_smi_output()
+                self.console.print(self.render_compact_line(sys_info, gpu))
         except KeyboardInterrupt:
             logger.info("System monitor terminated by user.")
             self.console.print("\n[bold red]Monitoring stopped by user.[/bold red]")
 
+    def render_compact_line(
+        self, system_info: Mapping[str, str], gpu_info: Mapping[str, str]
+    ) -> Text:
+        """Render a compact, single-line status suitable for small or non-TTY outputs.
 
-def show_ascii_art() -> None:
-    """Display ASCII art banner."""
-    ascii_art = r"""
-██████╗  ██████╗  ██████╗███╗   ███╗
-██╔══██╗██╔═══██╗██╔════╝████╗ ████║
-██████╔╝██║   ██║██║     ██╔████╔██║
-██╔══██╗██║   ██║██║     ██║╚██╔╝██║
-██║  ██║╚██████╔╝╚██████╗██║ ╚═╝ ██║
-╚═╝  ╚═╝ ╚═════╝  ╚═════╝╚═╝     ╚═╝
+        Args:
+            system_info: CPU/RAM/Swap metrics.
+            gpu_info: Parsed GPU metrics mapping.
 
-  ███╗   ███╗ ██████╗ ███╗   ██╗
-  ████╗ ████║██╔═══██╗████╗  ██║
-  ██╔████╔██║██║   ██║██╔██╗ ██║
-  ██║╚██╔╝██║██║   ██║██║╚██╗██║
-  ██║ ╚═╝ ██║╚██████╔╝██║ ╚████║
-  ╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═══╝
+        Returns:
+            A Rich Text object representing one concise status line.
 
-"""
-    console = Console()
-    try:
-        console.print(ascii_art, style="bold green")
-    except Exception as e:
-        logger.error("Failed to display ASCII art: %s", e)
+        """
+        cpu_pct = float(system_info["CPU Usage"].split("%")[0])
+        ram_pct = float(system_info["RAM Usage"].strip("%"))
+        swap_pct = float(system_info["Swap Used"].split("(")[-1].strip(")%"))
+        text = Text()
+        text.append("CPU ", style="bold")
+        text.append(
+            f"{cpu_pct:.0f}% ",
+            style=style_for_percent(cpu_pct, CPU_THRESHOLDS),
+        )
+        text.append("RAM ", style="bold")
+        text.append(
+            f"{ram_pct:.0f}% ({system_info['RAM Used']}/{system_info['RAM Total']}) ",
+            style=style_for_percent(ram_pct, RAM_THRESHOLDS),
+        )
+        text.append("SWAP ", style="bold")
+        text.append(
+            f"{swap_pct:.0f}% ", style=style_for_percent(swap_pct, SWAP_THRESHOLDS)
+        )
+
+        if gpu_info.get("error"):
+            text.append("GPU N/A", style="alert")
+            return text
+
+        gpu_pct = float(gpu_info.get("gpu_percent", 0.0))
+        vram_pct = float(gpu_info.get("vram_percent", 0.0))
+        temp_c = float(gpu_info.get("temp_c", 0.0))
+        text.append("| GPU ", style="bold")
+        text.append(
+            f"{gpu_pct:.0f}% ",
+            style=style_for_percent(gpu_pct, CPU_THRESHOLDS),
+        )
+        text.append("VRAM ", style="bold")
+        text.append(
+            (
+                f"{vram_pct:.0f}% ("
+                f"{gpu_info.get('vram_used', '?')}/"
+                f"{gpu_info.get('vram_total', '?')}) "
+            ),
+            style=style_for_percent(vram_pct, RAM_THRESHOLDS),
+        )
+        text.append("Temp ", style="bold")
+        text.append(f"{temp_c:.1f}°C", style=style_for_percent(temp_c, TEMP_THRESHOLDS))
+        return text
+
+
+def show_ascii_art() -> str:
+    """Return the ASCII art banner as text.
+
+    Returns:
+        The multi-line ASCII art string for the header banner.
+
+    """
+    return (
+        "╦═╗  ╔═╗  ╔═╗  ╔╦╗      ╔╦╗  ╔═╗  ╔╗╔  ╦  ╔╦╗  ╔═╗  ╦═╗\n"
+        "╠╦╝  ║ ║  ║    ║║║      ║║║  ║ ║  ║║║  ║   ║   ║ ║  ╠╦╝\n"
+        "╩╚═  ╚═╝  ╚═╝  ╩ ╩      ╩ ╩  ╚═╝  ╝╚╝  ╩   ╩   ╚═╝  ╩╚═"
+    )
 
 
 def check_rocm_smi_installed() -> None:
@@ -390,11 +549,13 @@ def setup_logging(log_file: str | None) -> None:
             sys.exit(1)
 
 
-def get_rocm_smi_output() -> str:
-    """Execute the rocm-smi command and extract GPU stats.
+def get_rocm_smi_output() -> dict[str, str]:
+    """Execute ``rocm-smi`` and extract GPU stats for a single device.
 
     Returns:
-        str: Formatted string containing GPU usage, VRAM usage, and temperature
+        Mapping with keys: ``temp_c``, ``gpu_percent``, ``vram_percent``, and
+        optionally ``vram_used``, ``vram_total``, ``name``. If unavailable,
+        returns ``{"error": "..."}``.
 
     """
     try:
@@ -413,36 +574,50 @@ def get_rocm_smi_output() -> str:
                 break
 
         if not stats:
-            return "Error: Could not find GPU statistics in rocm-smi output"
+            return {"error": "Could not find GPU statistics in rocm-smi output"}
 
         # Extract values using string splitting and indexing
         # The line format is consistent, so we can split by whitespace
         parts = [p for p in stats.split() if p]
 
         # Extract temperature (format: XX.X°C)
-        temp = next((p for p in parts if "°C" in p), "N/A")
-        # Extract VRAM% (format: XX%)
-        vram = next((p for p in parts if "%" in p), "N/A")
-        # Extract GPU% (last percentage in the line)
-        gpu = parts[-1] if parts else "N/A"
+        temp_token = next((p for p in parts if "°C" in p), "N/A")
+        vram_pct_token = next((p for p in parts if p.endswith("%")), "0%")
+        gpu_pct_token = parts[-1] if parts else "0%"
 
-        # Format the output
-        return (
-            f"GPU Stats │ Temperature: {temp} │ VRAM Usage: {vram} │ GPU Usage: {gpu}"
-        )
+        def pct_to_float(s: str) -> float:
+            try:
+                return float(s.replace("%", ""))
+            except Exception:
+                return 0.0
+
+        try:
+            temp_c = float(temp_token.replace("°C", "").replace("C", ""))
+        except Exception:
+            temp_c = 0.0
+
+        return {
+            "temp_c": f"{temp_c}",
+            "gpu_percent": f"{pct_to_float(gpu_pct_token)}",
+            "vram_percent": f"{pct_to_float(vram_pct_token)}",
+            # Unknown totals from plain text; placeholders keep UI informative
+            "vram_used": "N/A",
+            "vram_total": "N/A",
+            "name": "AMD GPU",
+        }
 
     except FileNotFoundError:
         logger.error(
-            "`rocm-smi` command not found. "
-            "Please install ROCm SMI and ensure it's in your PATH."
+                "`rocm-smi` command not found. Please install ROCm SMI and "
+                "ensure it's in your PATH."
         )
-        return "Error: rocm-smi command not found."
+        return {"error": "rocm-smi command not found"}
     except subprocess.CalledProcessError as e:
         logger.error("Failed to execute rocm-smi: %s", e)
-        return "Error retrieving GPU information."
+        return {"error": "Error retrieving GPU information"}
     except Exception as e:
         logger.exception("Unexpected error while executing rocm-smi: %s", e)
-        return "Error retrieving GPU information."
+        return {"error": "Error retrieving GPU information"}
 
 
 def check_system_compatibility() -> None:
@@ -476,12 +651,27 @@ def check_system_compatibility() -> None:
     type=int,
 )
 @click.option("-l", "--log-file", help="File path to save logs.", type=str)
-def main(interval: int, log_file: str | None) -> None:
+@click.option("--once", is_flag=True, help="Render once and exit.")
+@click.option("--no-ascii", is_flag=True, help="Disable ASCII banner.")
+@click.option("--no-color", is_flag=True, help="Disable terminal colors.")
+@click.option("--compact", is_flag=True, help="Compact single-line layout.")
+def main(
+    interval: int,
+    log_file: str | None,
+    once: bool,
+    no_ascii: bool,
+    no_color: bool,
+    compact: bool,
+) -> None:
     """Run the system monitoring application.
 
     Args:
         interval: Update interval in seconds
         log_file: Optional path to log file
+        once: Render a single update and exit.
+        no_ascii: Disable the startup ASCII banner.
+        no_color: Disable terminal colors.
+        compact: Use compact one-line/non-layout rendering.
 
     Raises:
         click.BadParameter: If the provided interval is not a positive integer.
@@ -494,9 +684,17 @@ def main(interval: int, log_file: str | None) -> None:
         setup_logging(log_file)
         check_rocm_smi_installed()
         check_system_compatibility()
-        show_ascii_art()
 
-        monitor = SystemMonitor(interval)
+        console = Console(theme=THEME, no_color=no_color)
+        if not console.is_terminal:
+            compact = True
+            if not once:
+                once = True
+
+        monitor = SystemMonitor(
+            interval, compact=compact, no_ascii=no_ascii, console=console
+        )
+        setattr(monitor, "_once", once)
         monitor.run()
 
     except click.BadParameter as e:
