@@ -17,8 +17,10 @@ Options:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -342,7 +344,13 @@ class SystemMonitor:
             temp_c = float(gpu_info.get("temp_c", 0.0))
             temp_pct = min(100.0, (temp_c / TEMP_THRESHOLDS["medium"]) * 100.0)
             temp_prog = self._progress(
-                "Temp", temp_pct, style_for_percent(temp_c, TEMP_THRESHOLDS)
+                "Temp",
+                temp_pct,
+                style_for_percent(temp_c, TEMP_THRESHOLDS),
+            )
+            temp_text = Text(
+                f"{temp_c:.1f}°C",
+                style=style_for_percent(temp_c, TEMP_THRESHOLDS),
             )
 
             meta = Text(
@@ -353,7 +361,24 @@ class SystemMonitor:
             gtable.add_row(meta)
             gtable.add_row(gpu_prog)
             gtable.add_row(vram_prog)
-            gtable.add_row(temp_prog)
+            gtable.add_row(Group(temp_prog, temp_text))
+            # Optional: show per-process info if available
+            procs = gpu_info.get("processes") or []
+            if procs:
+                ptable = Table.grid(padding=(0, 1))
+                # Header row
+                header = Text("PID    NAME           GPU  VRAM", style="muted")
+                ptable.add_row(header)
+                # Show up to 5 processes to keep the panel compact
+                for proc in procs[:5]:
+                    pid = str(proc.get("pid", "-"))
+                    name = str(proc.get("name", "-"))[:14]
+                    gpus = str(proc.get("gpus", "-"))
+                    vram = str(proc.get("vram_used", "-"))
+                    row = Text(f"{pid:>5}  {name:<14}  {gpus:>3}  {vram:>6}")
+                    ptable.add_row(row)
+                gtable.add_row(Text("Processes", style="bold"))
+                gtable.add_row(ptable)
             gpu_content = gtable
 
         gpu_panel = Panel.fit(
@@ -577,13 +602,20 @@ def get_rocm_smi_output() -> dict[str, str]:
             return {"error": "Could not find GPU statistics in rocm-smi output"}
 
         # Extract values using string splitting and indexing
-        # The line format is consistent, so we can split by whitespace
+        # The concise row contains multiple percentage fields; the last two
+        # are typically VRAM% then GPU%.
         parts = [p for p in stats.split() if p]
 
         # Extract temperature (format: XX.X°C)
         temp_token = next((p for p in parts if "°C" in p), "N/A")
-        vram_pct_token = next((p for p in parts if p.endswith("%")), "0%")
-        gpu_pct_token = parts[-1] if parts else "0%"
+        percent_tokens = [p for p in parts if p.endswith("%")]
+        if len(percent_tokens) >= 2:
+            vram_pct_token = percent_tokens[-2]
+            gpu_pct_token = percent_tokens[-1]
+        else:
+            # Fallbacks if unexpected format
+            vram_pct_token = "0%"
+            gpu_pct_token = percent_tokens[-1] if percent_tokens else "0%"
 
         def pct_to_float(s: str) -> float:
             try:
@@ -596,7 +628,8 @@ def get_rocm_smi_output() -> dict[str, str]:
         except Exception:
             temp_c = 0.0
 
-        return {
+        info: dict[str, str | list[dict[str, str]]]
+        info = {
             "temp_c": f"{temp_c}",
             "gpu_percent": f"{pct_to_float(gpu_pct_token)}",
             "vram_percent": f"{pct_to_float(vram_pct_token)}",
@@ -605,6 +638,25 @@ def get_rocm_smi_output() -> dict[str, str]:
             "vram_total": "N/A",
             "name": "AMD GPU",
         }
+
+        # Try to fetch VRAM used/total bytes from meminfo
+        try:
+            used_b, total_b = get_rocm_smi_vram_usage_bytes()
+            if used_b is not None and total_b is not None and total_b > 0:
+                info["vram_used"] = SystemMonitor.get_size(used_b)
+                info["vram_total"] = SystemMonitor.get_size(total_b)
+        except Exception as e:  # pragma: no cover - non-fatal enhancement
+            logger.debug("Failed to parse rocm-smi meminfo: %s", e)
+
+        # Try to gather per-process info using rocm-smi --showpids
+        try:
+            procs = get_rocm_smi_processes()
+            if procs:
+                info["processes"] = procs
+        except Exception as e:  # pragma: no cover - non-fatal enhancement
+            logger.debug("Failed to parse rocm-smi processes: %s", e)
+
+        return info  # type: ignore[return-value]
 
     except FileNotFoundError:
         logger.error(
@@ -618,6 +670,180 @@ def get_rocm_smi_output() -> dict[str, str]:
     except Exception as e:
         logger.exception("Unexpected error while executing rocm-smi: %s", e)
         return {"error": "Error retrieving GPU information"}
+
+
+def get_rocm_smi_processes() -> list[dict[str, str]]:
+    """Return processes using the GPU from ``rocm-smi --showpids``.
+
+    The function is resilient to common output variants across ROCm versions.
+
+    Returns:
+        A list of process dictionaries with keys: ``pid``, ``name``, ``gpus``,
+        and ``vram_used`` when available. Returns an empty list if no processes
+        are detected or output is not parseable.
+
+    """
+    try:
+        result = subprocess.run(
+            ["rocm-smi", "--showpids"], capture_output=True, text=True, check=True
+        )
+    except FileNotFoundError:
+        return []
+
+    text_out = result.stdout or ""
+    lines = [ln.rstrip() for ln in text_out.splitlines() if ln.strip()]
+    if not lines:
+        return []
+
+    processes: list[dict[str, str]] = []
+
+    # Strategy A: Table format with header including PID/PROCESS
+    header_idx = -1
+    for i, ln in enumerate(lines):
+        if (
+            ("PID" in ln and "PROCESS" in ln)
+            or ("PID" in ln and "NAME" in ln)
+        ):
+            header_idx = i
+            break
+    if header_idx != -1:
+        # Parse rows until a non-data separator or end
+        for ln in lines[header_idx + 1 :]:
+            if set(ln.strip()) <= set("-="):  # separator line
+                continue
+            # Split on 2+ spaces to keep columns
+            cols = re.split(r"\s{2,}", ln.strip())
+            if len(cols) < 2:
+                continue
+            # Heuristic mapping based on common rocm-smi layout
+            pid = cols[0]
+            name = cols[1] if len(cols) > 1 else "-"
+            gpus = cols[2] if len(cols) > 2 else "-"
+            vram = cols[3] if len(cols) > 3 else "-"
+            if pid.isdigit():
+                processes.append(
+                    {
+                        "pid": pid,
+                        "name": name,
+                        "gpus": gpus,
+                        "vram_used": vram,
+                    }
+                )
+        if processes:
+            return processes
+
+
+def get_rocm_smi_vram_usage_bytes() -> tuple[int | None, int | None]:
+    """Return VRAM used and total in bytes via ``rocm-smi --showmeminfo vram``.
+
+    The function tries JSON output first, then falls back to text parsing
+    for older ROCm outputs. It is robust to minor format differences.
+
+    Returns:
+        A tuple ``(used_bytes, total_bytes)`` where either value can be
+        ``None`` if parsing fails.
+
+    """
+    # Helper to parse sizes with units like 7.5GB or 1024MB.
+    def _to_bytes(token: str) -> int | None:
+        try:
+            m = re.match(r"(?i)^([0-9]*\.?[0-9]+)\s*([kmgtp]?b)$", token.strip())
+            if not m:
+                return int(token)
+            val = float(m.group(1))
+            unit = m.group(2).lower()
+            power = {"kb": 1, "mb": 2, "gb": 3, "tb": 4, "pb": 5}.get(unit, 0)
+            return int(val * (1024 ** power))
+        except Exception:
+            return None
+
+    # Attempt JSON first
+    try:
+        res = subprocess.run(
+            ["rocm-smi", "--json", "--showmeminfo", "vram"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        data = json.loads(res.stdout or "{}")
+        # Search recursively for meminfo fields
+        used_b: int | None = None
+        total_b: int | None = None
+
+        def _walk(obj: object) -> None:
+            nonlocal used_b, total_b
+            if isinstance(obj, dict):
+                # Common key variants
+                for k, v in obj.items():
+                    kl = str(k).lower()
+                    if isinstance(v, (dict, list)):
+                        _walk(v)
+                        continue
+                    if used_b is None and (
+                        "used" in kl and "vram" in kl or kl.endswith("used (b)")
+                    ):
+                        used_b = _to_bytes(str(v))
+                    if total_b is None and (
+                        "total" in kl and "vram" in kl or kl.endswith("total (b)")
+                    ):
+                        total_b = _to_bytes(str(v))
+            elif isinstance(obj, list):
+                for it in obj:
+                    _walk(it)
+
+        _walk(data)
+        if used_b is not None and total_b is not None:
+            return used_b, total_b
+    except Exception:
+        # Fall through to text parsing
+        pass
+
+    # Text fallback
+    try:
+        res = subprocess.run(
+            ["rocm-smi", "--showmeminfo", "vram"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except FileNotFoundError:
+        return None, None
+    except subprocess.CalledProcessError:
+        return None, None
+
+    used_b_txt: int | None = None
+    total_b_txt: int | None = None
+    for line in (res.stdout or "").splitlines():
+        line_str = line.strip()
+        # Try bytes first
+        m_total = re.search(r"(?i)total\s+memory.*?\(b\)\s*:\s*(\d+)", line_str)
+        m_used = re.search(
+            r"(?i)total\s+memory\s+used.*?\(b\)\s*:\s*(\d+)", line_str
+        )
+        if m_total:
+            try:
+                total_b_txt = int(m_total.group(1))
+            except Exception:
+                pass
+        if m_used:
+            try:
+                used_b_txt = int(m_used.group(1))
+            except Exception:
+                pass
+        # Units variant (e.g., 7.5GB)
+        m_total_u = re.search(
+            r"(?i)total\s+memory.*?:\s*([0-9]*\.?[0-9]+\s*[kmgtp]b)", line_str
+        )
+        m_used_u = re.search(
+            r"(?i)total\s+memory\s+used.*?:\s*([0-9]*\.?[0-9]+\s*[kmgtp]b)",
+            line_str,
+        )
+        if m_total_u and total_b_txt is None:
+            total_b_txt = _to_bytes(m_total_u.group(1))
+        if m_used_u and used_b_txt is None:
+            used_b_txt = _to_bytes(m_used_u.group(1))
+
+    return used_b_txt, total_b_txt
 
 
 def check_system_compatibility() -> None:
